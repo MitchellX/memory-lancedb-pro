@@ -136,6 +136,9 @@ def _clean_text(s: str) -> str:
 def _is_noise(s: str) -> bool:
     if not s:
         return True
+    if s.lstrip().startswith("/"):
+        # Skip slash-commands and control notes (e.g. /note self-improvement)
+        return True
     for p in NOISE_PREFIXES:
         if s.startswith(p):
             return True

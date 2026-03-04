@@ -73,6 +73,33 @@
         "default": false,
         "description": "Enable memory_list and memory_stats management tools"
       },
+      "sessionStrategy": {
+        "type": "string",
+        "enum": [
+          "memoryReflection",
+          "systemSessionMemory",
+          "none"
+        ],
+        "default": "memoryReflection",
+        "description": "Choose session pipeline: plugin memory-reflection, OpenClaw system session-memory, or none (disable session strategies)"
+      },
+      "sessionMemory": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Deprecated legacy switch. Kept for compatibility and mapped to sessionStrategy.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Deprecated. true -> sessionStrategy=systemSessionMemory, false -> sessionStrategy=none."
+          },
+          "messageCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "description": "Legacy compatibility field. Mapped to memoryReflection.messageCount."
+          }
+        }
+      },
       "autoCapture": {
         "type": "boolean"
       },
@@ -223,21 +250,99 @@
           }
         }
       },
-      "sessionMemory": {
+      "selfImprovement": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
           "enabled": {
             "type": "boolean",
             "default": true,
-            "description": "Store session summaries to LanceDB on /new command (replaces built-in session-memory hook)"
+            "description": "Enable integrated self-improvement reminders (inheritance + derived guidance)"
+          },
+          "beforeResetNote": {
+            "type": "boolean",
+            "default": true,
+            "description": "Append /note reminder before /new and /reset"
+          },
+          "skipSubagentBootstrap": {
+            "type": "boolean",
+            "default": true,
+            "description": "Do not inject bootstrap reminder into subagent sessions"
+          },
+          "ensureLearningFiles": {
+            "type": "boolean",
+            "default": true,
+            "description": "Ensure .learnings files exist in workspace for governance/distillation workflow"
+          }
+        }
+      },
+      "memoryReflection": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Deprecated: sessionStrategy controls the reflection pipeline"
+          },
+          "storeToLanceDB": {
+            "type": "boolean",
+            "default": true,
+            "description": "Store reflection artifacts into LanceDB for inheritance/derived retrieval"
+          },
+          "injectMode": {
+            "type": "string",
+            "enum": [
+              "inheritance-only",
+              "inheritance+derived"
+            ],
+            "default": "inheritance+derived",
+            "description": "Prompt injection mode for reflection memories"
           },
           "messageCount": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 100,
-            "default": 15,
-            "description": "Number of recent messages to include in session summary"
+            "maximum": 500,
+            "default": 120,
+            "description": "How many recent transcript messages to include in reflection input"
+          },
+          "maxInputChars": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 200000,
+            "default": 24000,
+            "description": "Maximum prompt characters sent to reflection model"
+          },
+          "timeoutMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 120000,
+            "default": 20000,
+            "description": "Timeout for embedded reflection run"
+          },
+          "thinkLevel": {
+            "type": "string",
+            "enum": [
+              "off",
+              "minimal",
+              "low",
+              "medium",
+              "high"
+            ],
+            "default": "medium",
+            "description": "Thinking level for reflection generation"
+          },
+          "errorReminderMaxEntries": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 3,
+            "description": "Max recent error signals to inject into reminder/reflection context"
+          },
+          "dedupeErrorSignals": {
+            "type": "boolean",
+            "default": true,
+            "description": "Deduplicate repeated tool error signatures per session"
           }
         }
       },
@@ -421,12 +526,77 @@
       "advanced": true
     },
     "sessionMemory.enabled": {
-      "label": "Session Memory",
-      "help": "Store session summaries to LanceDB when /new is triggered (replaces built-in session-memory hook)"
+      "label": "Session Memory (Deprecated)",
+      "help": "Legacy compatibility: true maps to systemSessionMemory, false maps to none.",
+      "advanced": true
     },
     "sessionMemory.messageCount": {
-      "label": "Session Message Count",
-      "help": "Number of recent messages to include in session summaries",
+      "label": "Session Message Count (Legacy)",
+      "help": "Legacy compatibility field; mapped to memoryReflection.messageCount.",
+      "advanced": true
+    },
+    "selfImprovement.enabled": {
+      "label": "Self-Improvement",
+      "help": "Enable inheritance/derived reminder module"
+    },
+    "selfImprovement.beforeResetNote": {
+      "label": "Reset Reminder Note",
+      "help": "Append /note self-improvement reminder before /new and /reset",
+      "advanced": true
+    },
+    "selfImprovement.skipSubagentBootstrap": {
+      "label": "Skip Subagent Bootstrap",
+      "help": "Avoid injecting reminder files into subagent bootstrap context",
+      "advanced": true
+    },
+    "selfImprovement.ensureLearningFiles": {
+      "label": "Ensure Learning Files",
+      "help": "Auto-create .learnings/LEARNINGS.md, ERRORS.md, FEATURE_REQUESTS.md when missing",
+      "advanced": true
+    },
+    "memoryReflection.enabled": {
+      "label": "Memory Reflection",
+      "help": "Deprecated: sessionStrategy now controls whether reflection hooks are enabled",
+      "advanced": true
+    },
+    "memoryReflection.storeToLanceDB": {
+      "label": "Store Reflection To LanceDB",
+      "help": "Store reflection artifacts into LanceDB to power inheritance and derived prompts",
+      "advanced": true
+    },
+    "memoryReflection.injectMode": {
+      "label": "Reflection Inject Mode",
+      "help": "Choose inheritance-only or inheritance+derived prompt injection",
+      "advanced": true
+    },
+    "memoryReflection.messageCount": {
+      "label": "Reflection Message Count",
+      "help": "Number of recent transcript messages used for reflection input",
+      "advanced": true
+    },
+    "memoryReflection.maxInputChars": {
+      "label": "Reflection Max Input Chars",
+      "help": "Maximum input characters sent to the reflection model",
+      "advanced": true
+    },
+    "memoryReflection.timeoutMs": {
+      "label": "Reflection Timeout (ms)",
+      "help": "Timeout for embedded reflection run",
+      "advanced": true
+    },
+    "memoryReflection.thinkLevel": {
+      "label": "Reflection Think Level",
+      "help": "Thinking level for reflection generation",
+      "advanced": true
+    },
+    "memoryReflection.errorReminderMaxEntries": {
+      "label": "Error Reminder Max Entries",
+      "help": "Maximum recent error signatures included in reminder/reflection context",
+      "advanced": true
+    },
+    "memoryReflection.dedupeErrorSignals": {
+      "label": "Dedupe Error Signatures",
+      "help": "Avoid repeated error reminders for the same normalized error signature in one session",
       "advanced": true
     },
     "scopes.default": {
@@ -447,6 +617,11 @@
     "enableManagementTools": {
       "label": "Management Tools",
       "help": "Enable memory_list and memory_stats tools for debugging and auditing",
+      "advanced": true
+    },
+    "sessionStrategy": {
+      "label": "Session Strategy",
+      "help": "Choose memoryReflection (plugin), systemSessionMemory (built-in hook), or none (disable session strategies)",
       "advanced": true
     }
   }

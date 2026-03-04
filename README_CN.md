@@ -80,7 +80,7 @@ OpenClaw 内置的 `memory-lancedb` 插件仅提供基本的向量搜索。**mem
 
 | 文件 | 用途 |
 |------|------|
-| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载 `before_agent_start`（自动回忆）、`agent_end`（自动捕获）、`command:new`（Session 记忆）等钩子 |
+| `index.ts` | 插件入口。注册到 OpenClaw Plugin API，解析配置，挂载 `before_agent_start`（自动回忆）、`agent_end`（自动捕获）、集成 `self-improvement`（`agent:bootstrap`、`command:new/reset`）和集成 `memory-reflection`（`command:new/reset`）钩子 |
 | `openclaw.plugin.json` | 插件元数据 + 完整 JSON Schema 配置声明（含 `uiHints`） |
 | `package.json` | NPM 包信息，依赖 `@lancedb/lancedb`、`openai`、`@sinclair/typebox` |
 | `cli.ts` | CLI 命令实现：`memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -146,14 +146,39 @@ Query → BM25 FTS ─────┘
 - 过滤 Meta 问题（"do you remember"）
 - 过滤寒暄（"hi"、"hello"、"HEARTBEAT"）
 
-### 7. Session 记忆
+### 7. 会话策略 + 集成模块
 
-- `/new` 命令触发时可保存上一个 Session 的对话摘要到 LanceDB
-- 默认关闭（`enabled: false`），因为 OpenClaw 已有原生 .jsonl 会话保存
-- 开启会导致大段摘要污染检索质量，建议仅在需要语义搜索历史会话时开启
-- 可配置消息数量（默认 15 条）
+- **集成 self-improvement 模块**：
+  - `agent:bootstrap`：注入 `SELF_IMPROVEMENT_REMINDER.md`（虚拟文件）
+  - `command:new` / `command:reset`：在会话重置前注入简短 `/note` 提醒
+  - 治理基线：自动确保 `.learnings/LEARNINGS.md`、`.learnings/ERRORS.md`、`.learnings/FEATURE_REQUESTS.md` 存在
+- **集成 memory-reflection 模块（核心闭环）**：
+  - **Reflect**：`command:new` / `command:reset` 基于最近 Session JSONL 生成高信号反思
+  - **Store**：默认把反思产物写入 LanceDB（`memoryReflection.storeToLanceDB`）
+  - **Inherit**：`before_agent_start` 注入 `<inherited-rules>`（稳定规则）
+  - **Derive**：`before_prompt_build` 注入 `<derived-focus>`（执行增量）和 `<error-detected>`
+  - 落盘：写入 `workspace/memory/reflections/YYYY-MM-DD/HHMMSS.md`，并在 `workspace/memory/YYYY-MM-DD.md` 追加索引
+- **会话策略开关**：
+  - `sessionStrategy: "memoryReflection"`（默认）：使用插件的 memory-reflection hooks
+  - `sessionStrategy: "systemSessionMemory"`：关闭插件反思 hooks，改用 OpenClaw 内置 `session-memory`
+  - `sessionStrategy: "none"`：禁用本插件的会话策略 hooks
+- 兼容说明：`sessionMemory.enabled=true|false` 映射为 `sessionStrategy="systemSessionMemory"|"none"`
 
-### 8. 自动捕获 & 自动回忆
+### 8. Self-Improvement
+
+- 触发事件：`agent:bootstrap`、`command:new`、`command:reset`
+- `agent:bootstrap`：注入 `SELF_IMPROVEMENT_REMINDER.md` 虚拟文件
+- `command:new` / `command:reset`：追加简短 `/note self-improvement ...` 提醒
+- 配置项：
+  - `selfImprovement.enabled`（默认：`true`）
+  - `selfImprovement.beforeResetNote`
+  - `selfImprovement.skipSubagentBootstrap`
+  - `selfImprovement.ensureLearningFiles`
+- 高价值核心工具：
+  - `self_improvement_log`：写入结构化 LRN/ERR/FEAT 条目
+- 治理型工具（`self_improvement_review`、`self_improvement_extract_skill`）建议仅在管理模式使用。
+
+### 9. 自动捕获 & 自动回忆
 
 - **Auto-Capture**（`agent_end` hook）: 从对话中提取 preference/fact/decision/entity，去重后存储（每次最多 3 条）
   - 触发词支持 **简体中文 + 繁體中文**（例如：记住/記住、偏好/喜好/喜歡、决定/決定 等）
@@ -357,6 +382,11 @@ openclaw config get plugins.slots.memory
     "maxHalfLifeMultiplier": 3
   },
   "enableManagementTools": false,
+  "sessionStrategy": "none",
+  "selfImprovement": {
+    "enabled": false,
+    "ensureLearningFiles": true
+  },
   "scopes": {
     "default": "global",
     "definitions": {
@@ -367,9 +397,15 @@ openclaw config get plugins.slots.memory
       "discord-bot": ["global", "agent:discord-bot"]
     }
   },
-  "sessionMemory": {
-    "enabled": false,
-    "messageCount": 15
+  "memoryReflection": {
+    "storeToLanceDB": true,
+    "injectMode": "inheritance+derived",
+    "messageCount": 120,
+    "maxInputChars": 24000,
+    "timeoutMs": 20000,
+    "thinkLevel": "medium",
+    "errorReminderMaxEntries": 3,
+    "dedupeErrorSignals": true
   }
 }
 ```

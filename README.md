@@ -80,7 +80,7 @@ The built-in `memory-lancedb` plugin in OpenClaw provides basic vector search. *
 
 | File | Purpose |
 |------|---------|
-| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` (auto-recall), `agent_end` (auto-capture), and `command:new` (session memory) hooks |
+| `index.ts` | Plugin entry point. Registers with OpenClaw Plugin API, parses config, mounts `before_agent_start` (auto-recall), `agent_end` (auto-capture), integrated `self-improvement` (`agent:bootstrap`, `command:new/reset`) and integrated `memory-reflection` (`command:new/reset`) hooks |
 | `openclaw.plugin.json` | Plugin metadata + full JSON Schema config declaration (with `uiHints`) |
 | `package.json` | NPM package info. Depends on `@lancedb/lancedb`, `openai`, `@sinclair/typebox` |
 | `cli.ts` | CLI commands: `memory list/search/stats/delete/delete-bulk/export/import/reembed/migrate` |
@@ -146,13 +146,42 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 - Meta-questions ("do you remember")
 - Greetings ("hi", "hello", "HEARTBEAT")
 
-### 7. Session Memory
+### 7. Session Strategy + Integrated Modules
 
-- Triggered on `/new` command — saves previous session summary to LanceDB
-- Disabled by default (OpenClaw already has native `.jsonl` session persistence)
-- Configurable message count (default: 15)
+- Core loop: **Reflect -> Store -> Inherit -> Derive -> Apply**
+- **Reflect** (`command:new` / `command:reset`):
+  - build high-signal reflection from recent session JSONL
+  - write markdown to `workspace/memory/reflections/YYYY-MM-DD/HHMMSS.md`
+  - append one pointer line into `workspace/memory/YYYY-MM-DD.md`
+- **Store**:
+  - persist reflection artifacts into LanceDB (default enabled via `memoryReflection.storeToLanceDB`)
+  - store structured metadata (`invariants`, `derived`, `errorSignals`) for retrieval reuse
+- **Inherit** (`before_agent_start`):
+  - inject stable rules from recent reflection memories as `<inherited-rules>`
+- **Derive** (`before_prompt_build`):
+  - inject latest execution deltas and open loops as `<derived-focus>`
+  - inject recent tool failures as `<error-detected>`
+- **Session strategy switch**:
+  - `sessionStrategy: "memoryReflection"` (default): use plugin reflection loop
+  - `sessionStrategy: "systemSessionMemory"`: disable plugin reflection hooks and rely on OpenClaw built-in `session-memory`
+  - `sessionStrategy: "none"`: disable plugin session strategy hooks
+- Legacy compatibility: `sessionMemory.enabled=true|false` maps to `sessionStrategy="systemSessionMemory"|"none"`
 
-### 8. Auto-Capture & Auto-Recall
+### 8. Self-Improvement
+
+- Triggered by `agent:bootstrap`, `command:new`, and `command:reset`
+- `agent:bootstrap`: injects `SELF_IMPROVEMENT_REMINDER.md` as a virtual file
+- `command:new` / `command:reset`: appends a short `/note self-improvement ...` reminder
+- Config keys:
+  - `selfImprovement.enabled` (default: `true`)
+  - `selfImprovement.beforeResetNote`
+  - `selfImprovement.skipSubagentBootstrap`
+  - `selfImprovement.ensureLearningFiles`
+- High-value core tool:
+  - `self_improvement_log`: write structured LRN/ERR/FEAT entries
+- Governance-heavy tools (`self_improvement_review`, `self_improvement_extract_skill`) are available in management mode.
+
+### 9. Auto-Capture & Auto-Recall
 
 - **Auto-Capture** (`agent_end` hook): Extracts preference/fact/decision/entity from conversations, deduplicates, stores up to 3 per turn
   - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
@@ -190,6 +219,32 @@ Add a line to your agent system prompt, e.g.:
 ---
 
 ## Installation
+
+### Enable integrated modules safely (recommended)
+
+If migrating from workspace hooks, keep only one execution path:
+
+1) Keep plugin integrated modules enabled (`selfImprovement.enabled=true`, `sessionStrategy="memoryReflection"`)
+2) Disable old workspace hooks with the same names
+3) Disable OpenClaw bundled `session-memory` to avoid overlap/noise
+
+Example:
+
+```bash
+# Disable bundled hook (important when using plugin-integrated reflection flow)
+openclaw hooks disable session-memory
+
+# Disable legacy workspace hooks after migration
+openclaw hooks disable self-improvement
+openclaw hooks disable memory-reflection
+
+# Ensure plugin is enabled
+openclaw config set plugins.entries.memory-lancedb-pro.enabled true
+
+# Restart gateway after plugin TS/config changes
+rm -rf /tmp/jiti/
+openclaw gateway restart
+```
 
 ### AI-safe install notes (anti-hallucination)
 
@@ -358,6 +413,11 @@ openclaw config get plugins.slots.memory
     "maxHalfLifeMultiplier": 3
   },
   "enableManagementTools": false,
+  "sessionStrategy": "none",
+  "selfImprovement": {
+    "enabled": false,
+    "ensureLearningFiles": true
+  },
   "scopes": {
     "default": "global",
     "definitions": {
@@ -368,9 +428,15 @@ openclaw config get plugins.slots.memory
       "discord-bot": ["global", "agent:discord-bot"]
     }
   },
-  "sessionMemory": {
-    "enabled": false,
-    "messageCount": 15
+  "memoryReflection": {
+    "storeToLanceDB": true,
+    "injectMode": "inheritance+derived",
+    "messageCount": 120,
+    "maxInputChars": 24000,
+    "timeoutMs": 20000,
+    "thinkLevel": "medium",
+    "errorReminderMaxEntries": 3,
+    "dedupeErrorSignals": true
   }
 }
 ```

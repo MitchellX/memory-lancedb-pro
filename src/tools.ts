@@ -6,6 +6,8 @@
 import { Type } from "@sinclair/typebox";
 import { stringEnum } from "openclaw/plugin-sdk";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { MemoryRetriever, RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { isNoise } from "./noise-filter.js";
@@ -30,6 +32,7 @@ interface ToolContext {
   scopeManager: MemoryScopeManager;
   embedder: Embedder;
   agentId?: string;
+  workspaceDir?: string;
 }
 
 function resolveAgentId(runtimeAgentId: unknown, fallback?: string): string | undefined {
@@ -62,6 +65,329 @@ function sanitizeMemoryForSerialization(results: RetrievalResult[]) {
     score: r.score,
     sources: r.sources,
   }));
+}
+
+function resolveWorkspaceDir(toolCtx: unknown, fallback?: string): string {
+  const runtime = toolCtx as Record<string, unknown> | undefined;
+  const runtimePath = typeof runtime?.workspaceDir === "string" ? runtime.workspaceDir.trim() : "";
+  if (runtimePath) return runtimePath;
+  if (fallback && fallback.trim()) return fallback;
+  return "/root/.openclaw/workspace";
+}
+
+function todayYmd(): string {
+  return new Date().toISOString().slice(0, 10).replace(/-/g, "");
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const fileWriteQueues = new Map<string, Promise<void>>();
+
+async function withFileWriteQueue<T>(filePath: string, action: () => Promise<T>): Promise<T> {
+  const previous = fileWriteQueues.get(filePath) ?? Promise.resolve();
+  let release: (() => void) | undefined;
+  const lock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const next = previous.then(() => lock);
+  fileWriteQueues.set(filePath, next);
+
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release?.();
+    if (fileWriteQueues.get(filePath) === next) {
+      fileWriteQueues.delete(filePath);
+    }
+  }
+}
+
+async function ensureLearningFiles(baseDir: string): Promise<void> {
+  const learningsDir = join(baseDir, ".learnings");
+  await mkdir(learningsDir, { recursive: true });
+  const files = ["LEARNINGS.md", "ERRORS.md", "FEATURE_REQUESTS.md"] as const;
+  for (const f of files) {
+    const p = join(learningsDir, f);
+    try {
+      const existing = await readFile(p, "utf-8");
+      if (existing.trim().length > 0) continue;
+    } catch {
+      // write below
+    }
+    await writeFile(p, `# ${f.replace(".md", "")}\n\n`, "utf-8");
+  }
+}
+
+async function nextLearningId(filePath: string, prefix: "LRN" | "ERR" | "FEAT"): Promise<string> {
+  const date = todayYmd();
+  let count = 0;
+  try {
+    const content = await readFile(filePath, "utf-8");
+    const matches = content.match(new RegExp(`\\[${prefix}-${date}-\\d{3}\\]`, "g"));
+    count = matches?.length ?? 0;
+  } catch {
+    // ignore
+  }
+  return `${prefix}-${date}-${String(count + 1).padStart(3, "0")}`;
+}
+
+export function registerSelfImprovementLogTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_log",
+      label: "Self-Improvement Log",
+      description: "Log structured learning/error/feature-request entries into .learnings for governance and later distillation.",
+      parameters: Type.Object({
+        type: stringEnum(["learning", "error", "feature"]),
+        summary: Type.String({ description: "One-line summary" }),
+        details: Type.Optional(Type.String({ description: "Detailed context or error output" })),
+        suggestedAction: Type.Optional(Type.String({ description: "Concrete action to prevent recurrence" })),
+        category: Type.Optional(Type.String({ description: "learning category (correction/best_practice/knowledge_gap) when type=learning" })),
+        area: Type.Optional(Type.String({ description: "frontend|backend|infra|tests|docs|config or custom area" })),
+        priority: Type.Optional(Type.String({ description: "low|medium|high|critical" })),
+      }),
+      async execute(_toolCallId, params) {
+        const {
+          type,
+          summary,
+          details = "",
+          suggestedAction = "",
+          category = "best_practice",
+          area = "config",
+          priority = "medium",
+        } = params as {
+          type: "learning" | "error" | "feature";
+          summary: string;
+          details?: string;
+          suggestedAction?: string;
+          category?: string;
+          area?: string;
+          priority?: string;
+        };
+        try {
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureLearningFiles(workspaceDir);
+          const learningsDir = join(workspaceDir, ".learnings");
+          const fileName = type === "learning" ? "LEARNINGS.md" : type === "error" ? "ERRORS.md" : "FEATURE_REQUESTS.md";
+          const filePath = join(learningsDir, fileName);
+          const idPrefix = type === "learning" ? "LRN" : type === "error" ? "ERR" : "FEAT";
+          const entryId = await withFileWriteQueue(filePath, async () => {
+            const id = await nextLearningId(filePath, idPrefix);
+            const nowIso = new Date().toISOString();
+            const titleSuffix = type === "learning" ? ` ${category}` : "";
+            const entry = [
+              `## [${id}]${titleSuffix}`,
+              "",
+              `**Logged**: ${nowIso}`,
+              `**Priority**: ${priority}`,
+              `**Status**: pending`,
+              `**Area**: ${area}`,
+              "",
+              "### Summary",
+              summary.trim(),
+              "",
+              "### Details",
+              details.trim() || "-",
+              "",
+              "### Suggested Action",
+              suggestedAction.trim() || "-",
+              "",
+              "### Metadata",
+              `- Source: memory-lancedb-pro/self_improvement_log`,
+              "---",
+              "",
+            ].join("\n");
+            const prev = await readFile(filePath, "utf-8").catch(() => "");
+            const separator = prev.trimEnd().length > 0 ? "\n\n" : "";
+            await appendFile(filePath, `${separator}${entry}`, "utf-8");
+            return id;
+          });
+
+          return {
+            content: [{ type: "text", text: `Logged ${type} entry ${entryId} to .learnings/${fileName}` }],
+            details: { action: "logged", type, id: entryId, filePath },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to log self-improvement entry: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_log_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_log" }
+  );
+}
+
+export function registerSelfImprovementExtractSkillTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_extract_skill",
+      label: "Extract Skill From Learning",
+      description: "Create a new skill scaffold from a learning entry and mark the source learning as promoted_to_skill.",
+      parameters: Type.Object({
+        learningId: Type.String({ description: "Learning ID like LRN-YYYYMMDD-001" }),
+        skillName: Type.String({ description: "Skill folder name, lowercase with hyphens" }),
+        sourceFile: Type.Optional(stringEnum(["LEARNINGS.md", "ERRORS.md", "FEATURE_REQUESTS.md"])),
+        outputDir: Type.Optional(Type.String({ description: "Relative output dir under workspace (default: skills)" })),
+      }),
+      async execute(_toolCallId, params) {
+        const { learningId, skillName, sourceFile = "LEARNINGS.md", outputDir = "skills" } = params as {
+          learningId: string;
+          skillName: string;
+          sourceFile?: "LEARNINGS.md" | "ERRORS.md" | "FEATURE_REQUESTS.md";
+          outputDir?: string;
+        };
+        try {
+          if (!/^(LRN|ERR|FEAT)-\d{8}-\d{3}$/.test(learningId)) {
+            return {
+              content: [{ type: "text", text: "Invalid learningId format. Use LRN-YYYYMMDD-001 / ERR-... / FEAT-..." }],
+              details: { error: "invalid_learning_id" },
+            };
+          }
+          if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(skillName)) {
+            return {
+              content: [{ type: "text", text: "Invalid skillName. Use lowercase letters, numbers, and hyphens only." }],
+              details: { error: "invalid_skill_name" },
+            };
+          }
+
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureLearningFiles(workspaceDir);
+          const learningsPath = join(workspaceDir, ".learnings", sourceFile);
+          const learningBody = await readFile(learningsPath, "utf-8");
+          const escapedLearningId = escapeRegExp(learningId.trim());
+          const entryRegex = new RegExp(`## \\[${escapedLearningId}\\][\\s\\S]*?(?=\\n## \\[|$)`, "m");
+          const match = learningBody.match(entryRegex);
+          if (!match) {
+            return {
+              content: [{ type: "text", text: `Learning entry ${learningId} not found in .learnings/${sourceFile}` }],
+              details: { error: "learning_not_found", learningId, sourceFile },
+            };
+          }
+
+          const summaryMatch = match[0].match(/### Summary\n([\s\S]*?)\n###/m);
+          const summary = (summaryMatch?.[1] ?? "Summarize the source learning here.").trim();
+
+          const safeOutputDir = outputDir.replace(/^\/+/, "").replace(/\.\./g, "");
+          const skillDir = join(workspaceDir, safeOutputDir || "skills", skillName);
+          await mkdir(skillDir, { recursive: true });
+          const skillPath = join(skillDir, "SKILL.md");
+          const skillTitle = skillName
+            .split("-")
+            .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
+            .join(" ");
+          const skillContent = [
+            "---",
+            `name: ${skillName}`,
+            `description: "Extracted from learning ${learningId}. Replace with a concise description."`,
+            "---",
+            "",
+            `# ${skillTitle}`,
+            "",
+            "## Why",
+            summary,
+            "",
+            "## When To Use",
+            "- [TODO] Define trigger conditions",
+            "",
+            "## Steps",
+            "1. [TODO] Add repeatable workflow steps",
+            "2. [TODO] Add verification steps",
+            "",
+            "## Source Learning",
+            `- Learning ID: ${learningId}`,
+            `- Source File: .learnings/${sourceFile}`,
+            "",
+          ].join("\n");
+          await writeFile(skillPath, skillContent, "utf-8");
+
+          const promotedMarker = `**Status**: promoted_to_skill`;
+          const skillPathMarker = `- Skill-Path: ${safeOutputDir || "skills"}/${skillName}`;
+          let updatedEntry = match[0];
+          updatedEntry = updatedEntry.includes("**Status**:")
+            ? updatedEntry.replace(/\*\*Status\*\*:\s*.+/m, promotedMarker)
+            : `${updatedEntry.trimEnd()}\n${promotedMarker}\n`;
+          if (!updatedEntry.includes("Skill-Path:")) {
+            updatedEntry = `${updatedEntry.trimEnd()}\n${skillPathMarker}\n`;
+          }
+          const updatedLearningBody = learningBody.replace(match[0], updatedEntry);
+          await writeFile(learningsPath, updatedLearningBody, "utf-8");
+
+          return {
+            content: [{ type: "text", text: `Extracted skill scaffold to ${safeOutputDir || "skills"}/${skillName}/SKILL.md and updated ${learningId}.` }],
+            details: {
+              action: "skill_extracted",
+              learningId,
+              sourceFile,
+              skillPath: `${safeOutputDir || "skills"}/${skillName}/SKILL.md`,
+            },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to extract skill: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_extract_skill_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_extract_skill" }
+  );
+}
+
+export function registerSelfImprovementReviewTool(api: OpenClawPluginApi, context: ToolContext) {
+  api.registerTool(
+    (toolCtx) => ({
+      name: "self_improvement_review",
+      label: "Self-Improvement Review",
+      description: "Summarize governance backlog from .learnings files (pending/high-priority/promoted counts).",
+      parameters: Type.Object({}),
+      async execute() {
+        try {
+          const workspaceDir = resolveWorkspaceDir(toolCtx, context.workspaceDir);
+          await ensureLearningFiles(workspaceDir);
+          const learningsDir = join(workspaceDir, ".learnings");
+          const files = ["LEARNINGS.md", "ERRORS.md", "FEATURE_REQUESTS.md"] as const;
+          const stats = { pending: 0, high: 0, promoted: 0, total: 0 };
+
+          for (const f of files) {
+            const content = await readFile(join(learningsDir, f), "utf-8").catch(() => "");
+            stats.total += (content.match(/^## \[/gm) || []).length;
+            stats.pending += (content.match(/\*\*Status\*\*:\s*pending/gi) || []).length;
+            stats.high += (content.match(/\*\*Priority\*\*:\s*(high|critical)/gi) || []).length;
+            stats.promoted += (content.match(/\*\*Status\*\*:\s*promoted(_to_skill)?/gi) || []).length;
+          }
+
+          const text = [
+            "Self-Improvement Governance Snapshot:",
+            `- Total entries: ${stats.total}`,
+            `- Pending: ${stats.pending}`,
+            `- High/Critical: ${stats.high}`,
+            `- Promoted: ${stats.promoted}`,
+            "",
+            "Recommended loop:",
+            "1) Resolve high-priority pending entries",
+            "2) Distill reusable rules into AGENTS.md / SOUL.md / TOOLS.md",
+            "3) Extract repeatable patterns as skills",
+          ].join("\n");
+
+          return {
+            content: [{ type: "text", text }],
+            details: { action: "review", stats },
+          };
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `Failed to review self-improvement backlog: ${error instanceof Error ? error.message : String(error)}` }],
+            details: { error: "self_improvement_review_failed", message: String(error) },
+          };
+        }
+      },
+    }),
+    { name: "self_improvement_review" }
+  );
 }
 
 // ============================================================================
@@ -899,7 +1225,8 @@ export function registerAllMemoryTools(
   context: ToolContext,
   options: {
     enableManagementTools?: boolean;
-  } = {},
+    enableSelfImprovementTools?: boolean;
+  } = {}
 ) {
   // Core tools (always enabled)
   registerMemoryRecallTool(api, context);
@@ -911,5 +1238,13 @@ export function registerAllMemoryTools(
   if (options.enableManagementTools) {
     registerMemoryStatsTool(api, context);
     registerMemoryListTool(api, context);
+  }
+  if (options.enableSelfImprovementTools !== false) {
+    registerSelfImprovementLogTool(api, context);
+    if (options.enableManagementTools) {
+      // Keep governance-heavy tools in management mode to avoid core-path bloat.
+      registerSelfImprovementExtractSkillTool(api, context);
+      registerSelfImprovementReviewTool(api, context);
+    }
   }
 }
