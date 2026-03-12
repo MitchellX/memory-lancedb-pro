@@ -62,6 +62,9 @@ async function runFunctionalE2E() {
   const workDir = mkdtempSync(path.join(tmpdir(), "memory-lancedb-pro-e2e-"));
 
   try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    );
     const { createMemoryCLI } = jiti("../cli.ts");
     const { MemoryStore } = jiti("../src/store.ts");
     const { createRetriever, DEFAULT_RETRIEVAL_CONFIG } = jiti("../src/retriever.ts");
@@ -145,7 +148,7 @@ async function runFunctionalE2E() {
     const versionOutput = await captureStdout(async () => {
       await program.parseAsync(["node", "openclaw", "memory-pro", "version"]);
     });
-    assert.match(versionOutput, /1\.1\.0-beta\.5/);
+    assert.match(versionOutput, new RegExp(pkg.version.replaceAll(".", "\\.")));
 
     const importOutput = await captureStdout(async () => {
       await program.parseAsync([
